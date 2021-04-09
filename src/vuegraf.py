@@ -6,6 +6,7 @@ import signal
 import sys
 import time
 from threading import Event
+from collections import defaultdict
 
 # InfluxDB v1
 import influxdb
@@ -133,9 +134,12 @@ signal.signal(signal.SIGHUP, handleExit)
 
 pauseEvent = Event()
 
-INTERVAL_SECS=60
-LAG_SECS=5
+INTERVAL_SECS=config["options"]["initial_interval_secs"]
 
+LAG_SECS=5
+chan_names=set()
+mark=znow=timestamp=old_timestamp=datetime.datetime.now()
+output_usage_hr_previous=defaultdict(lambda: 0)
 while running:
     for account in config["accounts"]:
         tmpEndingTime = datetime.datetime.utcnow() - datetime.timedelta(seconds=LAG_SECS)
@@ -176,31 +180,81 @@ while running:
                 if not timeStr.endswith('Z'):
                     timeStr = timeStr + 'Z'
 
-                tmpStartingTime = datetime.datetime.strptime(timeStr, '%Y-%m-%dT%H:%M:%S.%fZ')
+                try:
+                    tmpStartingTime = datetime.datetime.strptime(timeStr, '%Y-%m-%dT%H:%M:%S.%fZ')
+                except:
+                    tmpStartingTime = datetime.datetime.strptime(timeStr, '%Y-%m-%dT%H:%M:%SZ')
 
             # Avoid overlapping data in the event that vuegraf is quickly restarted.
             # This does not attempt to fill in gaps for scenarios when vuegraf is offline for long
             # periods.
-            if tmpStartingTime > start:
-                start = tmpStartingTime
-                info("Continuing from most recent record at time {}".format(start))
-            else:
-                info("Starting as of now {} (last known time is {})".format(start, tmpStartingTime))
+#            if tmpStartingTime > start:
+            start = tmpStartingTime
+            info("Continuing from most recent record at time {}".format(start))
+#            else:
+#                info("Starting as of now {} (last known time is {})".format(start, tmpStartingTime))
         else:
-            start = account['end'] + datetime.timedelta(seconds=1)
-            account['end'] = tmpEndingTime
+            start = account['end'].replace(microsecond=0) + datetime.timedelta(seconds=1)
+            account['end'] = tmpEndingTime.replace(microsecond=0)
+#            info(f"{start} to {tmpEndingTime}")
 
         try:
             deviceGids = list(account['deviceIdMap'].keys())
-            channels = account['vue'].get_devices_usage(deviceGids, None, scale=Scale.DAY.value, unit=Unit.KWH.value)
+#            channels = account['vue'].get_devices_usage(deviceGids, None, scale=Scale.DAY.value, unit=Unit.KWH.value)
             usageDataPoints = []
             device = None
             secondsInAnHour = 3600
             wattsInAKw = 1000
+            channels = account['vue'].get_devices_usage(deviceGids,None)
+            ts_diff=0
+            output_usage_hr=defaultdict(lambda: 0)
+            output_usage_hr_diff=defaultdict(lambda: 0)
+            output_usage_id=defaultdict(lambda: 0)
+            active_chan_count=0
+            for chan in channels:
+                chanName = lookupChannelName(account, chan)
+                usage=chan.usage*secondsInAnHour*wattsInAKw
+                timestamp = datetime.datetime.utcfromtimestamp(chan.timestamp)
+                ts_diff=(timestamp-old_timestamp).total_seconds()
+                if(ts_diff<config["options"]["nominal_update_rate"]):
+                    INTERVAL_SECS+=config["options"]["under_interval_to_add"]
+                    break
+                unique_id=f"{chan.device_gid}-{chan.channel_num}"
+                hrChanName=chanName if(config["options"]["hr_same_name_circuit_join"]) else f"{chanName}-{unique_id}"
+                chan_names.add(hrChanName)
+                if(usage>config["options"]["min_value_to_ignore"]):
+                    active_chan_count+=1
+                    output_usage_id[unique_id]=usage
+                    output_usage_hr[hrChanName]+=usage
+            if(active_chan_count>0):
+                if(len(output_usage_hr_previous)>0):
+                    for id in chan_names:
+                        if(abs(output_usage_hr_previous[id]-output_usage_hr[id])>=config["options"]["min_diff_watts"]):
+                            output_usage_hr_diff[id]=output_usage_hr[id]-output_usage_hr_previous[id]
+                        if(abs(output_usage_hr_previous[id]-output_usage_hr[id])>0):
+                            info(f"{id}\t{output_usage_hr[id]:.0f}\t{output_usage_hr_diff[id]:.0f}\t{timestamp}")
+                output_usage_hr_previous=output_usage_hr.copy()
+            znow=datetime.datetime.utcnow()
+
+            diff=(znow-mark).total_seconds()
+            real_diff=(znow-timestamp).total_seconds()
+            if(real_diff>config["options"]["max_target_lag"]):
+                INTERVAL_SECS-=config["options"]["over_lag_interval_to_sub"]
+            if(ts_diff>config["options"]["nominal_update_rate"]):
+                INTERVAL_SECS-=config["options"]["over_interval_to_sub"]
+            if(ts_diff>0):
+                mark=znow
+            INTERVAL_SECS=max(config["options"]["min_interval"],min(config["options"]["max_interval"],INTERVAL_SECS))
+            info(f"{real_diff} {diff} {INTERVAL_SECS} {ts_diff}")
+            old_timestamp=timestamp
+            pauseEvent.wait(INTERVAL_SECS)
+            continue
             for chan in channels:
                 chanName = lookupChannelName(account, chan)
 
                 usage, usage_start_time = account['vue'].get_chart_usage(chan, start, account['end'], scale=Scale.SECOND.value, unit=Unit.KWH.value)
+                len_usage=len(usage)
+                info(f"{chanName} {usage_start_time} {len_usage}")
                 index = 0
                 for kwhUsage in usage:
                     if kwhUsage is not None:
@@ -231,7 +285,7 @@ while running:
         except:
             error('Failed to record new usage data: {}'.format(sys.exc_info())) 
 
-    pauseEvent.wait(INTERVAL_SECS)
+#    pauseEvent.wait(INTERVAL_SECS)
 
 info('Finished')
 
