@@ -1,11 +1,45 @@
 {
-    "influxDb": {
-        "host": "my.influxdb.hostname",
-        "port": 8086,
-        "user": "root",
-        "pass": "root",
-        "database": "vue",
-        "reset": false
+{
+    "mqtt": {
+        "host": "localhost",
+        "port": 1883,
+        "output":{ 
+            "usage_id": {
+              "enable": false,
+              "output_format": "influx",
+              "measurement":"energy_usage",
+              "pattern": "home/emporia/{unique_id}",
+              "tags": ["id","account","device","chanName"]
+            },
+            "usage_hr": {
+              "enable": true,
+              "output_format": "influx",
+              "measurement":"energy_usage",
+              "pattern": "home/emporia/{chanName}/usage",
+              "tags": ["name"]
+            },
+            "usage_hr_diff": {
+              "enable": true,
+              "output_format": "influx",
+              "measurement":"energy_diff",
+              "pattern": "home/emporia/{chanName}/diff",
+              "tags": ["name"]
+            }
+        }
+    },
+    "options": {
+        "initial_interval_secs": 1.8,
+        "nominal_update_rate": 2.0,
+        "under_interval_to_add": 0.2,
+        "over_interval_to_sub": 0.2,
+        "max_target_lag": 4,
+        "over_lag_interval_to_sub": 0.1,
+        "max_interval": 1.8,
+        "min_interval": 0.5,
+        "min_diff_watts": 5,
+        "min_diff_watts_perc": 0.01,
+        "min_value_to_ignore": 0,
+        "hr_same_name_circuit_join": true
     },
     "accounts": [
         {

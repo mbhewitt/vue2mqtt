@@ -7,12 +7,9 @@ import sys
 import time
 from threading import Event
 from collections import defaultdict
+import paho.mqtt.client as mqtt
 
-# InfluxDB v1
-import influxdb
-
-# InfluxDB v2
-import influxdb_client
+from influx_line_protocol import Metric
 
 from pyemvue import PyEmVue
 from pyemvue.enums import Scale, Unit
@@ -43,47 +40,6 @@ configFilename = sys.argv[1]
 config = {}
 with open(configFilename) as configFile:
     config = json.load(configFile)
-
-influxVersion = 1
-if 'version' in config['influxDb']:
-    influxVersion = config['influxDb']['version']
-
-bucket = ''
-write_api = None
-query_api = None
-if influxVersion == 2:
-    info('Using InfluxDB version 2')
-    bucket = config['influxDb']['bucket']
-    org = config['influxDb']['org']
-    token = config['influxDb']['token']
-    url= config['influxDb']['url']
-    influx2 = influxdb_client.InfluxDBClient(
-       url=url,
-       token=token,
-       org=org
-    )
-    write_api = influx2.write_api(write_options=influxdb_client.client.write_api.SYNCHRONOUS)
-    query_api = influx2.query_api()
-
-    if config['influxDb']['reset']:
-        info('Resetting database')
-        delete_api = influx2.delete_api()
-        start = "1970-01-01T00:00:00Z"
-        stop = datetime.datetime.utcnow().isoformat(timespec='seconds')
-        delete_api.delete(start, stop, '_measurement="energy_usage"', bucket=bucket, org=org)    
-else:
-    info('Using InfluxDB version 1')
-    # Only authenticate to ingress if 'user' entry was provided in config
-    if 'user' in config['influxDb']:
-        influx = influxdb.InfluxDBClient(host=config['influxDb']['host'], port=config['influxDb']['port'], username=config['influxDb']['user'], password=config['influxDb']['pass'], database=config['influxDb']['database'])
-    else:
-        influx = influxdb.InfluxDBClient(host=config['influxDb']['host'], port=config['influxDb']['port'], database=config['influxDb']['database'])
-
-    influx.create_database(config['influxDb']['database'])
-
-    if config['influxDb']['reset']:
-        info('Resetting database')
-        influx.delete_series(measurement='energy_usage')
 
 running = True
 
@@ -133,159 +89,134 @@ signal.signal(signal.SIGINT, handleExit)
 signal.signal(signal.SIGHUP, handleExit)
 
 pauseEvent = Event()
+secondsInAnHour = 3600
+wattsInAKw = 1000
 
-INTERVAL_SECS=config["options"]["initial_interval_secs"]
 
-LAG_SECS=5
+
+def logInAndInit(account):
+    if 'vue' not in account:
+        account['vue'] = PyEmVue()
+        account['vue'].login(username=account['email'], password=account['password'])
+        info('Login completed')
+
+        account['INTERVAL_SECS']=config["options"]["initial_interval_secs"]
+        populateDevices(account)
+
+def embelish_tags(tags,id,account,chan,unique_id,hrChanName,chanName,deviceName):
+    tags[id]['account']=account["name"]
+    tags[id]['device']=deviceName
+    tags[id]['chanName']=chanName
+    tags[id]['unique_id']=unique_id
+    tags[id]['device_gid']=chan.device_gid
+    tags[id]['channel_num']=chan.channel_num
+    tags[id]['name']=hrChanName
+    tags[id]['id']=id
+
+def runChannels(account,channels,old_timestamp,output,chan_names,tags):
+    active_chan_count=0
+    timestamp=old_timestamp
+    chan_timestamp=0
+    for chan in channels:
+        deviceName = lookupDeviceName(account, chan.device_gid)
+        chanName = lookupChannelName(account, chan)
+        usage=chan.usage*secondsInAnHour*wattsInAKw
+        timestamp = datetime.datetime.utcfromtimestamp(chan.timestamp)
+        chan_timestamp = chan.timestamp
+        ts_diff=(timestamp-old_timestamp).total_seconds()
+        if(ts_diff<config["options"]["nominal_update_rate"]):
+            break
+        unique_id=f"{chan.device_gid}-{chan.channel_num}"
+        hrChanName=chanName if(config["options"]["hr_same_name_circuit_join"]) else f"{chanName}-{unique_id}"
+        chan_names.add(hrChanName)
+        embelish_tags(tags,unique_id,account,chan,unique_id,hrChanName,chanName,deviceName)
+        embelish_tags(tags,hrChanName,account,chan,unique_id,hrChanName,chanName,deviceName)
+        if(usage>config["options"]["min_value_to_ignore"]):
+            active_chan_count+=1
+            output['usage_id'][unique_id]=usage
+            output['usage_hr'][hrChanName]+=usage
+    return (active_chan_count,timestamp,chan_timestamp)
+
+def modify_interval(account,timestamp,old_timestamp):
+    znow=datetime.datetime.utcnow()
+
+    real_diff=(znow-timestamp).total_seconds()
+
+    ts_diff=(timestamp-old_timestamp).total_seconds()
+    if(ts_diff<config["options"]["nominal_update_rate"]):
+        account['INTERVAL_SECS']+=config["options"]["under_interval_to_add"]
+    if(real_diff>config["options"]["max_target_lag"]):
+        account['INTERVAL_SECS']-=config["options"]["over_lag_interval_to_sub"]
+    if(ts_diff>config["options"]["nominal_update_rate"]):
+        account['INTERVAL_SECS']-=config["options"]["over_interval_to_sub"]
+
+    account['INTERVAL_SECS']=max(config["options"]["min_interval"],min(config["options"]["max_interval"],account['INTERVAL_SECS']))
+
+#    info(f"{real_diff} {account['INTERVAL_SECS']} {ts_diff}")
+
+def mqtt_connect():
+    client = mqtt.Client("emporia_mqtt",False)
+    client.connect(config['mqtt']['host'],config['mqtt']['port'])
+    client.max_inflight_messages_set(10000)
+    return client
+
+def find_diff(output,active_chan_count,chan_names):
+    if(active_chan_count>0):
+        if(len(output['usage_hr_previous'])>0):
+            for id in chan_names:
+                diff=output['usage_hr'][id]-output['usage_hr_previous'][id]
+                perc=abs(diff)/output['usage_hr'][id] if output['usage_hr'][id] != 0 else 1
+                if(abs(diff)>=config["options"]["min_diff_watts"] and perc>config["options"]["min_diff_watts_perc"]):
+                    output['usage_hr_diff'][id]=diff
+#                if(abs(output['usage_hr_diff'][id]-output['usage_hr'][id])>0 ):
+#                    info(f"{id}\t{output['usage_hr'][id]:.0f}\t{output['usage_hr_diff'][id]:.0f} {perc:.4f}")
+        output['usage_hr_previous']=output['usage_hr'].copy()
+
+def format_output_mqtt(output,tags,timestamp,client):
+    out=[]
+    client.reconnect()
+    for type in config['mqtt']['output'].keys():
+        if(config['mqtt']['output'][type]['output_format']=="influx" and config['mqtt']['output'][type]['enable']):
+            for id,v in output[type].items():
+                if(abs(v)<=config["options"]["min_value_to_ignore"]):
+                    continue
+                metric = Metric(config['mqtt']['output'][type]['measurement'])
+                metric.with_timestamp(timestamp*1000000000)
+                metric.add_value('usage',v)
+                for m in config['mqtt']['output'][type]['tags']:
+                    metric.add_tag(m,tags[id][m])
+                topic=config['mqtt']['output'][type]['pattern'].format(**tags[id])
+                rc=client.publish(topic,f"{metric}",1)
+                info(f"{topic} {metric}")
+                out.append((topic,metric))
+    info(f"{len(out)} Metrics sent to mqtt")
+    return out
+
 chan_names=set()
-mark=znow=timestamp=old_timestamp=datetime.datetime.now()
-output_usage_hr_previous=defaultdict(lambda: 0)
+old_timestamp=datetime.datetime.utcnow()
+output={}
+output['usage_hr_previous']=defaultdict(lambda: 0)
+client=mqtt_connect()
 while running:
     for account in config["accounts"]:
-        tmpEndingTime = datetime.datetime.utcnow() - datetime.timedelta(seconds=LAG_SECS)
-
-        if 'vue' not in account:
-            account['vue'] = PyEmVue()
-            account['vue'].login(username=account['email'], password=account['password'])
-            info('Login completed')
-
-            populateDevices(account)
-
-            account['end'] = tmpEndingTime
-
-            start = account['end'] - datetime.timedelta(seconds=INTERVAL_SECS)
-
-            tmpStartingTime = start
-            timeStr = ''
-            if influxVersion == 2:
-                timeCol = '_time'
-                result = query_api.query('from(bucket:"' + bucket + '") ' +
-                                         '|> range(start: -3w) ' +
-                                         '|> filter(fn: (r) => ' +
-                                         '  r._measurement == "energy_usage" and ' +
-                                         '  r._field == "usage" and ' +
-                                         '  r.account_name == "' + account['name'] + '")' +
-                                         '|> last()')
-
-                if len(result) > 0 and len(result[0].records) > 0:
-                    lastRecord = result[0].records[0]
-                    timeStr = lastRecord['_time'].isoformat()
-            else:
-                result = influx.query('select last(usage), time from energy_usage where account_name = \'{}\''.format(account['name']))
-                if len(result) > 0:
-                    timeStr = next(result.get_points())['time']
-
-            if len(timeStr) > 0:
-                timeStr = timeStr[:26]
-                if not timeStr.endswith('Z'):
-                    timeStr = timeStr + 'Z'
-
-                try:
-                    tmpStartingTime = datetime.datetime.strptime(timeStr, '%Y-%m-%dT%H:%M:%S.%fZ')
-                except:
-                    tmpStartingTime = datetime.datetime.strptime(timeStr, '%Y-%m-%dT%H:%M:%SZ')
-
-            # Avoid overlapping data in the event that vuegraf is quickly restarted.
-            # This does not attempt to fill in gaps for scenarios when vuegraf is offline for long
-            # periods.
-#            if tmpStartingTime > start:
-            start = tmpStartingTime
-            info("Continuing from most recent record at time {}".format(start))
-#            else:
-#                info("Starting as of now {} (last known time is {})".format(start, tmpStartingTime))
-        else:
-            start = account['end'].replace(microsecond=0) + datetime.timedelta(seconds=1)
-            account['end'] = tmpEndingTime.replace(microsecond=0)
-#            info(f"{start} to {tmpEndingTime}")
+        logInAndInit(account)
 
         try:
             deviceGids = list(account['deviceIdMap'].keys())
-#            channels = account['vue'].get_devices_usage(deviceGids, None, scale=Scale.DAY.value, unit=Unit.KWH.value)
-            usageDataPoints = []
-            device = None
-            secondsInAnHour = 3600
-            wattsInAKw = 1000
             channels = account['vue'].get_devices_usage(deviceGids,None)
-            ts_diff=0
-            output_usage_hr=defaultdict(lambda: 0)
-            output_usage_hr_diff=defaultdict(lambda: 0)
-            output_usage_id=defaultdict(lambda: 0)
-            active_chan_count=0
-            for chan in channels:
-                chanName = lookupChannelName(account, chan)
-                usage=chan.usage*secondsInAnHour*wattsInAKw
-                timestamp = datetime.datetime.utcfromtimestamp(chan.timestamp)
-                ts_diff=(timestamp-old_timestamp).total_seconds()
-                if(ts_diff<config["options"]["nominal_update_rate"]):
-                    INTERVAL_SECS+=config["options"]["under_interval_to_add"]
-                    break
-                unique_id=f"{chan.device_gid}-{chan.channel_num}"
-                hrChanName=chanName if(config["options"]["hr_same_name_circuit_join"]) else f"{chanName}-{unique_id}"
-                chan_names.add(hrChanName)
-                if(usage>config["options"]["min_value_to_ignore"]):
-                    active_chan_count+=1
-                    output_usage_id[unique_id]=usage
-                    output_usage_hr[hrChanName]+=usage
-            if(active_chan_count>0):
-                if(len(output_usage_hr_previous)>0):
-                    for id in chan_names:
-                        if(abs(output_usage_hr_previous[id]-output_usage_hr[id])>=config["options"]["min_diff_watts"]):
-                            output_usage_hr_diff[id]=output_usage_hr[id]-output_usage_hr_previous[id]
-                        if(abs(output_usage_hr_previous[id]-output_usage_hr[id])>0):
-                            info(f"{id}\t{output_usage_hr[id]:.0f}\t{output_usage_hr_diff[id]:.0f}\t{timestamp}")
-                output_usage_hr_previous=output_usage_hr.copy()
-            znow=datetime.datetime.utcnow()
-
-            diff=(znow-mark).total_seconds()
-            real_diff=(znow-timestamp).total_seconds()
-            if(real_diff>config["options"]["max_target_lag"]):
-                INTERVAL_SECS-=config["options"]["over_lag_interval_to_sub"]
-            if(ts_diff>config["options"]["nominal_update_rate"]):
-                INTERVAL_SECS-=config["options"]["over_interval_to_sub"]
-            if(ts_diff>0):
-                mark=znow
-            INTERVAL_SECS=max(config["options"]["min_interval"],min(config["options"]["max_interval"],INTERVAL_SECS))
-            info(f"{real_diff} {diff} {INTERVAL_SECS} {ts_diff}")
+            output['usage_hr']=defaultdict(lambda: 0)
+            output['usage_hr_diff']=defaultdict(lambda: 0)
+            output['usage_id']=defaultdict(lambda: 0)
+            tags=defaultdict(lambda: {})
+            (active_chan_count,timestamp,chan_timestamp)=runChannels(account,channels,old_timestamp,output,chan_names,tags)
+            modify_interval(account,timestamp,old_timestamp)
+            find_diff(output,active_chan_count,chan_names)
+            out_values=format_output_mqtt(output,tags,chan_timestamp,client)
+            print("")
             old_timestamp=timestamp
-            pauseEvent.wait(INTERVAL_SECS)
-            continue
-            for chan in channels:
-                chanName = lookupChannelName(account, chan)
-
-                usage, usage_start_time = account['vue'].get_chart_usage(chan, start, account['end'], scale=Scale.SECOND.value, unit=Unit.KWH.value)
-                len_usage=len(usage)
-                info(f"{chanName} {usage_start_time} {len_usage}")
-                index = 0
-                for kwhUsage in usage:
-                    if kwhUsage is not None:
-                        watts = float(secondsInAnHour * wattsInAKw) * kwhUsage
-                        if influxVersion == 2:
-                            dataPoint = influxdb_client.Point("energy_usage").tag("account_name", account['name']).tag("device_name", chanName).field("usage", watts).time(time=start + datetime.timedelta(seconds=index))
-                            usageDataPoints.append(dataPoint)
-                        else:
-                            dataPoint = {
-                                "measurement": "energy_usage",
-                                "tags": {
-                                    "account_name": account['name'],
-                                    "device_name": chanName,
-                                },
-                                "fields": {
-                                    "usage": watts,
-                                },
-                                "time": start + datetime.timedelta(seconds=index)
-                            }
-                            usageDataPoints.append(dataPoint)
-                        index = index + 1
-
-            info('Submitted datapoints to database; account="{}"; points={}'.format(account['name'], len(usageDataPoints)))
-            if influxVersion == 2:
-                write_api.write(bucket=bucket, record=usageDataPoints)
-            else:
-                influx.write_points(usageDataPoints)
+            pauseEvent.wait(account['INTERVAL_SECS'])
         except:
             error('Failed to record new usage data: {}'.format(sys.exc_info())) 
-
-#    pauseEvent.wait(INTERVAL_SECS)
 
 info('Finished')
 
