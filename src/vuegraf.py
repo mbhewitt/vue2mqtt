@@ -233,6 +233,28 @@ def mqtt_connect():
     client.loop_start()
     return client
 
+def InstantRun(account,output,old_timestamp,chan_names,client,success_timestamp,instant,out_values,retry):
+    deviceGids = list(account['deviceIdMap'].keys())
+    channels = account['vue'].get_devices_usage(deviceGids,instant)
+    output['usage_hr']=defaultdict(lambda: 0.0)
+    output['usage_hr_diff']=defaultdict(lambda: 0.0)
+    output['usage_id']=defaultdict(lambda: 0.0)
+    output['device']=defaultdict(lambda: 0.0)
+    tags=defaultdict(lambda: {})
+
+    chan_timestamp=channels[0].timestamp
+    timestamp = datetime.datetime.utcfromtimestamp(chan_timestamp)
+
+    active_chan_count=0
+    if(chan_timestamp not in success_timestamp):
+        active_chan_count=runChannels(account,channels,output,chan_names,tags,out_values,client)
+        success_timestamp[chan_timestamp]=instant
+    if(active_chan_count>0 and retry==False):
+        find_diff(output,active_chan_count,chan_names,out_values,client,chan_timestamp,tags)
+        classifier(output,tags,out_values,client,chan_timestamp)
+
+    return (timestamp,active_chan_count)
+
 client=mqtt_connect()
 
 chan_names=set()
@@ -242,12 +264,19 @@ loop_now=datetime.datetime.utcnow()
 success_timestamp={}
 hits=0
 old_timestamp=datetime.datetime.utcnow()
+failed_instant_list_check=set()
+
+def failed_add(failed_instant_list,failed_instant_list_check,instant):
+   instant_sec=instant.replace(microsecond=0)
+   if(instant_sec not in failed_instant_list_check):
+       failed_instant_list_check.add(instant_sec)
+       failed_instant_list.insert(0,instant)
 
 while running:
 #def instantRun(hits,instant=None):
     instant=None
     if(instant==None):
-        instant = datetime.datetime.utcnow()
+        instant = datetime.datetime.utcnow() #- datetime.timedelta(seconds=60)
 
     for account in config["accounts"]:
         logInAndInit(account)
@@ -256,38 +285,34 @@ while running:
             non_loop_time=datetime.datetime.utcnow()
 
             out_values=[]
-            deviceGids = list(account['deviceIdMap'].keys())
-            channels = account['vue'].get_devices_usage(deviceGids,instant)
+            (timestamp,active_chan_count)=InstantRun(account,output,old_timestamp,chan_names,client,success_timestamp,instant,out_values,False)
             hits+=1
-            output['usage_hr']=defaultdict(lambda: 0.0)
-            output['usage_hr_diff']=defaultdict(lambda: 0.0)
-            output['usage_id']=defaultdict(lambda: 0.0)
-            output['device']=defaultdict(lambda: 0.0)
-            tags=defaultdict(lambda: {})
-
-
-            chan_timestamp=channels[0].timestamp
-            timestamp = datetime.datetime.utcfromtimestamp(chan_timestamp)
-
-            active_chan_count=0
-            if(chan_timestamp not in success_timestamp):
-                active_chan_count=runChannels(account,channels,output,chan_names,tags,out_values,client)
-                success_timestamp[chan_timestamp]=instant
 
             (real_diff,ts_diff)=modify_interval(account,timestamp,old_timestamp,instant)
 
             loop_diff=(datetime.datetime.utcnow()-loop_now).total_seconds()
 
             if(loop_diff>config["options"]["nominal_update_rate"]*1.5 or 
-                    active_chan_count==0 and loop_diff>config["options"]["nominal_update_rate"]-0.1):
-                failed_instant_list.append(instant)
-                print("F ",active_chan_count,loop_diff)
+                    active_chan_count==0 and loop_diff>config["options"]["nominal_update_rate"]-0.1 or 
+                    ts_diff > config["options"]["nominal_update_rate"]):
+                failed_add(failed_instant_list,failed_instant_list_check,instant  - datetime.timedelta(seconds=7))
+                failed_add(failed_instant_list,failed_instant_list_check,instant  - datetime.timedelta(seconds=5))
+                failed_add(failed_instant_list,failed_instant_list_check,instant  - datetime.timedelta(seconds=3))
+                #failed_add(failed_instant_list,failed_instant_list_check,instant  - datetime.timedelta(seconds=2))
+                failed_add(failed_instant_list,failed_instant_list_check,instant  - datetime.timedelta(seconds=1))
+                #failed_add(failed_instant_list,failed_instant_list_check,instant)
+                failed_add(failed_instant_list,failed_instant_list_check,instant  + datetime.timedelta(seconds=1))
+                #failed_add(failed_instant_list,failed_instant_list_check,instant  + datetime.timedelta(seconds=2))
+                failed_add(failed_instant_list,failed_instant_list_check,instant  + datetime.timedelta(seconds=3))
+                last_failed_instant=instant
 
-            if(active_chan_count>0):
-                print(active_chan_count,loop_diff)
-                find_diff(output,active_chan_count,chan_names,out_values,client,chan_timestamp,tags)
-                classifier(output,tags,out_values,client,chan_timestamp)
-
+            last_failed_diff=(instant-last_failed_instant).total_seconds()
+#            print(last_failed_diff)
+            if(last_failed_diff>30 and len(failed_instant_list)>0):
+                instantX=failed_instant_list.pop()
+                (timestampX,active_chan_countX)=InstantRun(account,output,old_timestamp,chan_names,client,success_timestamp,instantX,out_values,True)
+                hits+=1
+                info(f"Retry: instant:{instantX}, records:{active_chan_countX}, failed:{len(failed_instant_list):.1f},success:{len(success_timestamp)}")
 #            format_output_mqtt(out_values,output,tags,chan_timestamp,client)
 
             non_loop_time2=datetime.datetime.utcnow()
@@ -300,7 +325,7 @@ while running:
                 loop_diff=(datetime.datetime.utcnow()-loop_now).total_seconds()
                 loop_now=datetime.datetime.utcnow()
                 info_int= f"Lag: {round(real_diff,2)}, interval: {account['INTERVAL_SECS']}, ts_diff: {ts_diff}"
-                info(f"MQTT sent:{len(out_values)}, {info_int}, server_hits:{hits}, loop_diff:{loop_diff}, failed:{len(failed_instant_list)}")
+                info(f"MQTT sent:{len(out_values)}, {info_int}, server_hits:{hits}, loop_diff:{loop_diff:.1f}, failed:{len(failed_instant_list):.1f},success:{len(success_timestamp)}")
                 hits=0
 #            print("")
             old_timestamp=timestamp
