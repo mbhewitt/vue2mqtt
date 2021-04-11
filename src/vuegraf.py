@@ -28,6 +28,7 @@ def error(msg):
     log("ERROR", msg)
 
 client=None
+failed_instant_list=[]
 
 
 def handleExit(signum, frame):
@@ -118,19 +119,15 @@ def embelish_tags(tags,id,account,chan,unique_id,hrChanName,chanName,deviceName)
     tags[id]['branchName']=hrChanName
     tags[id]['id']=id
 
-def runChannels(account,channels,old_timestamp,output,chan_names,tags,out,client):
+def runChannels(account,channels,output,chan_names,tags,out,client):
     active_chan_count=0
-    timestamp=old_timestamp
     chan_timestamp=0
     for chan in channels:
         deviceName = lookupDeviceName(account, chan.device_gid)
         chanName = lookupChannelName(account, chan)
         usage=chan.usage*secondsInAnHour*wattsInAKw
-        timestamp = datetime.datetime.utcfromtimestamp(chan.timestamp)
         chan_timestamp = chan.timestamp
-        ts_diff=(timestamp-old_timestamp).total_seconds()
-        if(ts_diff==0):
-            break
+
         unique_id=f"{chan.device_gid}-{chan.channel_num}"
         hrChanName=chanName if(config["options"]["hr_same_name_circuit_join"]) else f"{chanName}-{unique_id}"
         chan_names.add(hrChanName)
@@ -146,10 +143,9 @@ def runChannels(account,channels,old_timestamp,output,chan_names,tags,out,client
             usage=output['usage_hr'][hrChanName]
             if(output['usage_hr_previous'][hrChanName]!=usage):
                 send_mqtt(tags,chan_timestamp,client,'usage_hr',hrChanName,usage,out)
-    return (active_chan_count,timestamp,chan_timestamp)
+    return active_chan_count
 
-def modify_interval(account,timestamp,old_timestamp):
-    znow=datetime.datetime.utcnow()
+def modify_interval(account,timestamp,old_timestamp,znow):
 
     real_diff=(znow-timestamp).total_seconds()
 
@@ -240,14 +236,19 @@ def mqtt_connect():
 client=mqtt_connect()
 
 chan_names=set()
-old_timestamp=datetime.datetime.utcnow()
 output={}
 output['usage_hr_previous']=defaultdict(lambda: 0)
-hits=0
 loop_now=datetime.datetime.utcnow()
-calc_interval=0
-non_loop_diff=0
+success_timestamp={}
+hits=0
+old_timestamp=datetime.datetime.utcnow()
+
 while running:
+#def instantRun(hits,instant=None):
+    instant=None
+    if(instant==None):
+        instant = datetime.datetime.utcnow()
+
     for account in config["accounts"]:
         logInAndInit(account)
 
@@ -256,7 +257,7 @@ while running:
 
             out_values=[]
             deviceGids = list(account['deviceIdMap'].keys())
-            channels = account['vue'].get_devices_usage(deviceGids,None)
+            channels = account['vue'].get_devices_usage(deviceGids,instant)
             hits+=1
             output['usage_hr']=defaultdict(lambda: 0.0)
             output['usage_hr_diff']=defaultdict(lambda: 0.0)
@@ -264,10 +265,29 @@ while running:
             output['device']=defaultdict(lambda: 0.0)
             tags=defaultdict(lambda: {})
 
-            (active_chan_count,timestamp,chan_timestamp)=runChannels(account,channels,old_timestamp,output,chan_names,tags,out_values,client)
-            (real_diff,ts_diff)=modify_interval(account,timestamp,old_timestamp)
-            find_diff(output,active_chan_count,chan_names,out_values,client,chan_timestamp,tags)
-            classifier(output,tags,out_values,client,chan_timestamp)
+
+            chan_timestamp=channels[0].timestamp
+            timestamp = datetime.datetime.utcfromtimestamp(chan_timestamp)
+
+            active_chan_count=0
+            if(chan_timestamp not in success_timestamp):
+                active_chan_count=runChannels(account,channels,output,chan_names,tags,out_values,client)
+                success_timestamp[chan_timestamp]=instant
+
+            (real_diff,ts_diff)=modify_interval(account,timestamp,old_timestamp,instant)
+
+            loop_diff=(datetime.datetime.utcnow()-loop_now).total_seconds()
+
+            if(loop_diff>config["options"]["nominal_update_rate"]*1.5 or 
+                    active_chan_count==0 and loop_diff>config["options"]["nominal_update_rate"]-0.1):
+                failed_instant_list.append(instant)
+                print("F ",active_chan_count,loop_diff)
+
+            if(active_chan_count>0):
+                print(active_chan_count,loop_diff)
+                find_diff(output,active_chan_count,chan_names,out_values,client,chan_timestamp,tags)
+                classifier(output,tags,out_values,client,chan_timestamp)
+
 #            format_output_mqtt(out_values,output,tags,chan_timestamp,client)
 
             non_loop_time2=datetime.datetime.utcnow()
@@ -280,7 +300,7 @@ while running:
                 loop_diff=(datetime.datetime.utcnow()-loop_now).total_seconds()
                 loop_now=datetime.datetime.utcnow()
                 info_int= f"Lag: {round(real_diff,2)}, interval: {account['INTERVAL_SECS']}, ts_diff: {ts_diff}"
-                info(f"MQTT sent:{len(out_values)}, {info_int}, server_hits:{hits}, loop_diff:{loop_diff}")
+                info(f"MQTT sent:{len(out_values)}, {info_int}, server_hits:{hits}, loop_diff:{loop_diff}, failed:{len(failed_instant_list)}")
                 hits=0
 #            print("")
             old_timestamp=timestamp
@@ -289,5 +309,7 @@ while running:
             (e,m,t)=sys.exc_info()
             error('Failed to record new usage data: {},{}\n{}'.format(e,m,traceback.format_tb(t))) 
 
-info('Finished')
+#    instantRun(hits,None)
 
+info(f"{failed_instant_list}")
+info('Finished')
