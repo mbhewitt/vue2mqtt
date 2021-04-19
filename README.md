@@ -1,3 +1,6 @@
+#Now with more mqtt
+I reworked the code to submit to mqtt instead of a direct feed to influxdb
+
 # Overview
 
 The [Emporia Vue](https://emporiaenergy.com "Emporia's Homepage") energy monitoring kit allows homeowners to monitor their electrical usage. It monitors the main feed consumption and up to 8 (or 16 in the newer version) individual branch circuits, and feeds that data back to the Emporia API server.
