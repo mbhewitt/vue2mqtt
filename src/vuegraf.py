@@ -141,7 +141,7 @@ def runChannels(account,channels,output,chan_names,tags,out,client):
     if(active_chan_count>0):
         for hrChanName in chan_names:
             usage=output['usage_hr'][hrChanName]
-            if(output['usage_hr_previous'][hrChanName]!=usage):
+            if(output['usage_hr_previous'][hrChanName]!=usage or int(time.time())%30):
                 send_mqtt(tags,chan_timestamp,client,'usage_hr',hrChanName,usage,out)
     return active_chan_count
 
@@ -333,6 +333,11 @@ while running:
         except:
             (e,m,t)=sys.exc_info()
             error('Failed to record new usage data: {},{}\n{}'.format(e,m,traceback.format_tb(t))) 
+            try:
+                failed_add(failed_instant_list,failed_instant_list_check,instant)
+            except:
+                (e,m,t)=sys.exc_info()
+                error('Failed to record new usage data: {},{}\n{}'.format(e,m,traceback.format_tb(t))) 
 
 #    instantRun(hits,None)
 
