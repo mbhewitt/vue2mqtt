@@ -141,7 +141,7 @@ def runChannels(account,channels,output,chan_names,tags,out,client):
     if(active_chan_count>0):
         for hrChanName in chan_names:
             usage=output['usage_hr'][hrChanName]
-            if(output['usage_hr_previous'][hrChanName]!=usage or int(time.time())%30):
+            if(output['usage_hr_previous'][hrChanName]!=usage or int(time.time())%30==0):
                 send_mqtt(tags,chan_timestamp,client,'usage_hr',hrChanName,usage,out)
     return active_chan_count
 
