@@ -74,17 +74,17 @@ def lookupDeviceName(account, device_gid):
         deviceName = account['deviceIdMap'][device_gid].device_name
     return deviceName
 
-def lookupChannelName(account, chan):
-    if chan.device_gid not in account['deviceIdMap']:
+def lookupChannelName(account, chan,device_gid,channel_num):
+    if device_gid not in account['deviceIdMap']:
         populateDevices(account)
 
-    deviceName = lookupDeviceName(account, chan.device_gid)
-    name = "{}-{}".format(deviceName, chan.channel_num)
+    deviceName = lookupDeviceName(account, device_gid)
+    name = "{}-{}".format(deviceName, channel_num)
     if 'devices' in account:
         for device in account['devices']:
             if 'name' in device and device['name'] == deviceName:
                 try:
-                    num = int(chan.channel_num)
+                    num = int(channel_num)
                     if 'channels' in device and len(device['channels']) >= num:
                         name = device['channels'][num - 1]
                 except:
@@ -109,30 +109,32 @@ def logInAndInit(account):
         account['INTERVAL_SECS']=config["options"]["initial_interval_secs"]
         populateDevices(account)
 
-def embelish_tags(tags,id,account,chan,unique_id,hrChanName,chanName,deviceName):
+def embelish_tags(tags,id,account,chan,unique_id,hrChanName,chanName,deviceName,device_gid,channel_num):
     tags[id]['account']=account["name"]
     tags[id]['device']=deviceName
     tags[id]['chanName']=chanName
     tags[id]['unique_id']=unique_id
-    tags[id]['device_gid']=chan.device_gid
-    tags[id]['channel_num']=chan.channel_num
+    tags[id]['device_gid']=device_gid
+    tags[id]['channel_num']=channel_num
     tags[id]['branchName']=hrChanName
     tags[id]['id']=id
 
-def runChannels(account,channels,output,chan_names,tags,out,client):
+def runChannels(account,channels,output,chan_names,tags,out,client,device_gid):
     active_chan_count=0
     chan_timestamp=0
-    for chan in channels:
-        deviceName = lookupDeviceName(account, chan.device_gid)
-        chanName = lookupChannelName(account, chan)
+    for (channel_num,chan) in channels.items():
+        if(chan.usage == None):
+            continue
+        deviceName = lookupDeviceName(account, device_gid)
+        chanName = lookupChannelName(account, chan,device_gid,channel_num)
         usage=chan.usage*secondsInAnHour*wattsInAKw
-        chan_timestamp = chan.timestamp
+        chan_timestamp = chan.timestamp.timestamp()
 
-        unique_id=f"{chan.device_gid}-{chan.channel_num}"
+        unique_id=f"{device_gid}-{channel_num}"
         hrChanName=chanName if(config["options"]["hr_same_name_circuit_join"]) else f"{chanName}-{unique_id}"
         chan_names.add(hrChanName)
-        embelish_tags(tags,unique_id,account,chan,unique_id,hrChanName,chanName,deviceName)
-        embelish_tags(tags,hrChanName,account,chan,unique_id,hrChanName,chanName,deviceName)
+        embelish_tags(tags,unique_id,account,chan,unique_id,hrChanName,chanName,deviceName,device_gid,channel_num)
+        embelish_tags(tags,hrChanName,account,chan,unique_id,hrChanName,chanName,deviceName,device_gid,channel_num)
         if(usage>config["options"]["min_value_to_ignore"]):
             active_chan_count+=1
             send_mqtt(tags,chan_timestamp,client,'usage_id',unique_id,usage,out)
@@ -235,25 +237,28 @@ def mqtt_connect():
 
 def InstantRun(account,output,old_timestamp,chan_names,client,success_timestamp,instant,out_values,retry):
     deviceGids = list(account['deviceIdMap'].keys())
-    channels = account['vue'].get_devices_usage(deviceGids,instant)
+    usages = account['vue'].get_device_list_usage(deviceGids,instant)
     output['usage_hr']=defaultdict(lambda: 0.0)
     output['usage_hr_diff']=defaultdict(lambda: 0.0)
     output['usage_id']=defaultdict(lambda: 0.0)
     output['device']=defaultdict(lambda: 0.0)
     tags=defaultdict(lambda: {})
 
-    chan_timestamp=channels[0].timestamp
-    timestamp = datetime.datetime.utcfromtimestamp(chan_timestamp)
+    for gid, device in usages.items():
+        channels=device.channels
+        chan_timestamp=channels['1,2,3'].timestamp.timestamp()
+#        timestamp=chan_timestamp
+        timestamp = datetime.datetime.utcfromtimestamp(chan_timestamp)
 
-    active_chan_count=0
-    if(chan_timestamp not in success_timestamp):
-        active_chan_count=runChannels(account,channels,output,chan_names,tags,out_values,client)
-        success_timestamp[chan_timestamp]=instant
-    if(active_chan_count>0 and retry==False):
-        find_diff(output,active_chan_count,chan_names,out_values,client,chan_timestamp,tags)
-        classifier(output,tags,out_values,client,chan_timestamp)
+        active_chan_count=0
+        if(chan_timestamp not in success_timestamp):
+            active_chan_count=runChannels(account,channels,output,chan_names,tags,out_values,client,gid)
+            success_timestamp[chan_timestamp]=instant
+        if(active_chan_count>0 and retry==False):
+            find_diff(output,active_chan_count,chan_names,out_values,client,chan_timestamp,tags)
+            classifier(output,tags,out_values,client,chan_timestamp)
 
-    return (timestamp,active_chan_count)
+        return (timestamp,active_chan_count)
 
 client=mqtt_connect()
 
@@ -331,6 +336,7 @@ while running:
             old_timestamp=timestamp
             pauseEvent.wait(calc_interval)
         except:
+            raise
             (e,m,t)=sys.exc_info()
             error('Failed to record new usage data: {},{}\n{}'.format(e,m,traceback.format_tb(t))) 
             try:
