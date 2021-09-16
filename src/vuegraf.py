@@ -60,6 +60,7 @@ def populateDevices(account):
         deviceIdMap[device.device_gid] = device
         for chan in device.channels:
             key = "{}-{}".format(device.device_gid, chan.channel_num)
+            info(f"Key {key}")
             if chan.name is None and chan.channel_num == '1,2,3':
                 chan.name = device.device_name
             channelIdMap[key] = chan
@@ -122,17 +123,22 @@ def embelish_tags(tags,id,account,chan,unique_id,hrChanName,chanName,deviceName,
 def runChannels(account,channels,output,chan_names,tags,out,client,device_gid):
     active_chan_count=0
     chan_timestamp=0
+    local_chan_name=defaultdict(lambda: 0.0)
+#    info(f"yf {channels}")
     for (channel_num,chan) in channels.items():
+#        info(f"xz {device_gid} {channel_num} {chan}")
+
         if(chan.usage == None):
             continue
         deviceName = lookupDeviceName(account, device_gid)
         chanName = lookupChannelName(account, chan,device_gid,channel_num)
         usage=chan.usage*secondsInAnHour*wattsInAKw
         chan_timestamp = chan.timestamp.timestamp()
-
+#        info(f"ff {deviceName},{chanName},{usage},{channel_num}")
         unique_id=f"{device_gid}-{channel_num}"
         hrChanName=chanName if(config["options"]["hr_same_name_circuit_join"]) else f"{chanName}-{unique_id}"
         chan_names.add(hrChanName)
+        local_chan_name[hrChanName]+=1
         embelish_tags(tags,unique_id,account,chan,unique_id,hrChanName,chanName,deviceName,device_gid,channel_num)
         embelish_tags(tags,hrChanName,account,chan,unique_id,hrChanName,chanName,deviceName,device_gid,channel_num)
         if(usage>config["options"]["min_value_to_ignore"]):
@@ -142,8 +148,12 @@ def runChannels(account,channels,output,chan_names,tags,out,client,device_gid):
             output['usage_hr'][hrChanName]+=usage
     if(active_chan_count>0):
         for hrChanName in chan_names:
+            if(hrChanName not in local_chan_name):
+                continue
             usage=output['usage_hr'][hrChanName]
             if(output['usage_hr_previous'][hrChanName]!=usage or int(time.time())%30==0):
+#                info(f"{tags}")
+#                info(f"dd {hrChanName} {active_chan_count}")
                 send_mqtt(tags,chan_timestamp,client,'usage_hr',hrChanName,usage,out)
     return active_chan_count
 
@@ -237,28 +247,35 @@ def mqtt_connect():
 
 def InstantRun(account,output,old_timestamp,chan_names,client,success_timestamp,instant,out_values,retry):
     deviceGids = list(account['deviceIdMap'].keys())
-    usages = account['vue'].get_device_list_usage(deviceGids,instant)
+    usages={}
+    for deviceGid in deviceGids:
+        usage = account['vue'].get_device_list_usage([deviceGid],instant)
+        usages.update(usage)
     output['usage_hr']=defaultdict(lambda: 0.0)
     output['usage_hr_diff']=defaultdict(lambda: 0.0)
     output['usage_id']=defaultdict(lambda: 0.0)
     output['device']=defaultdict(lambda: 0.0)
     tags=defaultdict(lambda: {})
+    timestamp=0
+    acc=0
 
     for gid, device in usages.items():
+
         channels=device.channels
         chan_timestamp=channels['1,2,3'].timestamp.timestamp()
 #        timestamp=chan_timestamp
         timestamp = datetime.datetime.utcfromtimestamp(chan_timestamp)
 
         active_chan_count=0
-        if(chan_timestamp not in success_timestamp):
+        if(chan_timestamp not in success_timestamp[gid]):
             active_chan_count=runChannels(account,channels,output,chan_names,tags,out_values,client,gid)
-            success_timestamp[chan_timestamp]=instant
+            success_timestamp[gid][chan_timestamp]=instant
+            acc+=active_chan_count
         if(active_chan_count>0 and retry==False):
             find_diff(output,active_chan_count,chan_names,out_values,client,chan_timestamp,tags)
             classifier(output,tags,out_values,client,chan_timestamp)
 
-        return (timestamp,active_chan_count)
+    return (timestamp,acc)
 
 client=mqtt_connect()
 
@@ -266,7 +283,7 @@ chan_names=set()
 output={}
 output['usage_hr_previous']=defaultdict(lambda: 0)
 loop_now=datetime.datetime.utcnow()
-success_timestamp={}
+success_timestamp=defaultdict(lambda: {})
 hits=0
 old_timestamp=datetime.datetime.utcnow()
 failed_instant_list_check=set()
